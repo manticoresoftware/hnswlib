@@ -626,6 +626,33 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         output.close();
     }
 
+	template <typename WRITER>
+	void saveIndex ( WRITER & tWriter )
+	{
+		tWriter.Write ( offsetLevel0_ );
+		tWriter.Write ( max_elements_ );
+        tWriter.Write ( cur_element_count );
+        tWriter.Write ( size_data_per_element_ );
+        tWriter.Write ( label_offset_ );
+        tWriter.Write ( offsetData_ );
+        tWriter.Write ( maxlevel_ );
+        tWriter.Write ( enterpoint_node_);
+        tWriter.Write ( maxM_ );
+
+        tWriter.Write ( maxM0_ );
+        tWriter.Write ( M_ );
+        tWriter.Write ( mult_ );
+        tWriter.Write ( ef_construction_ );
+
+        tWriter.Write ( data_level0_memory_, cur_element_count * size_data_per_element_ );
+        for (size_t i = 0; i < cur_element_count; i++)
+		{
+            unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
+            tWriter.Write ( linkListSize );
+            if (linkListSize)
+                tWriter.Write ( linkLists_[i], linkListSize );
+        }
+	}
 
     void loadIndex(const std::string &location, SpaceInterface<dist_t> *s, size_t max_elements_i = 0) {
         std::ifstream input(location, std::ios::binary);
@@ -734,6 +761,114 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return;
     }
 
+    template <typename READER>
+    bool loadIndex ( READER & tReader, SpaceInterface<dist_t> *s, std::string & error )
+    {
+        size_t total_filesize = tReader.GetFilesize();
+
+        tReader.Read ( offsetLevel0_ );
+        tReader.Read ( max_elements_ );
+        tReader.Read ( cur_element_count );
+
+        tReader.Read ( size_data_per_element_ );
+        tReader.Read ( label_offset_ );
+        tReader.Read ( offsetData_ );
+        tReader.Read ( maxlevel_ );
+        tReader.Read ( enterpoint_node_ );
+
+        tReader.Read ( maxM_ );
+        tReader.Read ( maxM0_ );
+        tReader.Read ( M_ );
+        tReader.Read ( mult_ );
+        tReader.Read ( ef_construction_ );
+
+        data_size_ = s->get_data_size();
+        fstdistfunc_ = s->get_dist_func();
+        dist_func_param_ = s->get_dist_func_param();
+
+        auto pos = tReader.GetPos();
+
+        /// Optional - check if index is ok:
+        tReader.SeekTo ( pos + cur_element_count * size_data_per_element_, 0 );
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if ( tReader.GetPos() < 0 || tReader.GetPos() >= total_filesize )
+            {
+                error = "Index seems to be corrupted or unsupported";
+                return false;
+            }
+
+            unsigned int linkListSize;
+            tReader.Read ( linkListSize );
+            if (linkListSize != 0)
+                tReader.SeekTo ( tReader.GetPos() + linkListSize, 0 );
+        }
+
+        // throw exception if it either corrupted or old index
+        if ( tReader.GetPos() != total_filesize)
+        {
+            error = "Index seems to be corrupted or unsupported";
+            return false;
+
+        }
+        /// Optional check end
+
+        tReader.SeekTo ( pos, 0 );
+
+        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        if (data_level0_memory_ == nullptr)
+        {
+            error = "Not enough memory: loadIndex failed to allocate level0";
+            return false;
+        }
+
+        tReader.Read ( data_level0_memory_, cur_element_count * size_data_per_element_ );
+
+        size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
+
+        size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
+        std::vector<std::mutex>(max_elements_).swap(link_list_locks_);
+        std::vector<std::mutex>(MAX_LABEL_OPERATION_LOCKS).swap(label_op_locks_);
+
+        visited_list_pool_ = new VisitedListPool(1, max_elements_);
+
+        linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
+        if (linkLists_ == nullptr)
+        {
+            error = "Not enough memory: loadIndex failed to allocate linklists";
+            return false;
+        }
+
+        element_levels_ = std::vector<int>(max_elements_);
+        revSize_ = 1.0 / mult_;
+        ef_ = 10;
+        for (size_t i = 0; i < cur_element_count; i++) {
+            label_lookup_[getExternalLabel(i)] = i;
+            unsigned int linkListSize;
+            tReader.Read(linkListSize);
+            if (linkListSize == 0) {
+                element_levels_[i] = 0;
+                linkLists_[i] = nullptr;
+            } else {
+                element_levels_[i] = linkListSize / size_links_per_element_;
+                linkLists_[i] = (char *) malloc(linkListSize);
+                if (linkLists_[i] == nullptr)
+                {
+                    error = "Not enough memory: loadIndex failed to allocate linklist";
+                    return false;
+                }
+                tReader.Read(linkLists_[i], linkListSize);
+            }
+        }
+
+        for (size_t i = 0; i < cur_element_count; i++) {
+            if (isMarkedDeleted(i)) {
+                num_deleted_ += 1;
+                if (allow_replace_deleted_) deleted_elements.insert(i);
+            }
+        }
+
+        return true;
+    }
 
     template<typename data_t>
     std::vector<data_t> getDataByLabel(labeltype label) const {
