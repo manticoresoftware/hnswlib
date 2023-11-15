@@ -5,11 +5,6 @@ project(hnswlib VERSION "1.0.0" LANGUAGES CXX)
 add_library(hnswlib INTERFACE)
 target_include_directories ( hnswlib INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/hnswlib>$<INSTALL_INTERFACE:include> )
 
-if (CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64 OR CMAKE_SYSTEM_PROCESSOR STREQUAL amd64)
-	message ( STATUS "Add sse 4.1 to compiler flags for ${CMAKE_SYSTEM_PROCESSOR} arch" )
-	target_compile_options ( hnswlib INTERFACE $<${GNUC_CXX}:-msse4.1> )
-endif ()
-
 set ( EXPORT_CMAKE_DIR "lib/cmake/hnswlib" )
 
 install(
