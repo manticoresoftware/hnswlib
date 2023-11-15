@@ -644,13 +644,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         tWriter.Write ( mult_ );
         tWriter.Write ( ef_construction_ );
 
-        tWriter.Write ( data_level0_memory_, cur_element_count * size_data_per_element_ );
+        tWriter.Write ( (uint8_t*)data_level0_memory_, cur_element_count * size_data_per_element_ );
         for (size_t i = 0; i < cur_element_count; i++)
 		{
             unsigned int linkListSize = element_levels_[i] > 0 ? size_links_per_element_ * element_levels_[i] : 0;
             tWriter.Write ( linkListSize );
             if (linkListSize)
-                tWriter.Write ( linkLists_[i], linkListSize );
+                tWriter.Write ( (uint8_t*)(linkLists_[i]), linkListSize );
         }
 	}
 
@@ -764,7 +764,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     template <typename READER>
     bool loadIndex ( READER & tReader, SpaceInterface<dist_t> *s, std::string & error )
     {
-        size_t total_filesize = tReader.GetFilesize();
+        size_t total_filesize = tReader.GetFileSize();
 
         tReader.Read ( offsetLevel0_ );
         tReader.Read ( max_elements_ );
@@ -789,7 +789,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         auto pos = tReader.GetPos();
 
         /// Optional - check if index is ok:
-        tReader.SeekTo ( pos + cur_element_count * size_data_per_element_, 0 );
+        tReader.Seek ( pos + cur_element_count * size_data_per_element_ );
         for (size_t i = 0; i < cur_element_count; i++) {
             if ( tReader.GetPos() < 0 || tReader.GetPos() >= total_filesize )
             {
@@ -800,7 +800,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             unsigned int linkListSize;
             tReader.Read ( linkListSize );
             if (linkListSize != 0)
-                tReader.SeekTo ( tReader.GetPos() + linkListSize, 0 );
+                tReader.Seek ( tReader.GetPos() + linkListSize );
         }
 
         // throw exception if it either corrupted or old index
@@ -812,7 +812,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         /// Optional check end
 
-        tReader.SeekTo ( pos, 0 );
+        tReader.Seek(pos);
 
         data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
@@ -821,7 +821,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return false;
         }
 
-        tReader.Read ( data_level0_memory_, cur_element_count * size_data_per_element_ );
+        tReader.Read ( (uint8_t*)data_level0_memory_, cur_element_count * size_data_per_element_ );
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
 
@@ -856,7 +856,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     error = "Not enough memory: loadIndex failed to allocate linklist";
                     return false;
                 }
-                tReader.Read(linkLists_[i], linkListSize);
+                tReader.Read ( (uint8_t*)(linkLists_[i]), linkListSize);
             }
         }
 
