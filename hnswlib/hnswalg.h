@@ -161,11 +161,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    inline std::mutex& getLabelOpMutex(labeltype label) const {
+/*    inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
         size_t lock_id = label & (MAX_LABEL_OPERATION_LOCKS - 1);
         return label_op_locks_[lock_id];
-    }
+    }*/
 
 
     inline labeltype getExternalLabel(tableint internal_id) const {
@@ -881,7 +881,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             throw std::runtime_error("Label not found");
         }
         tableint internalId = search->second;
-        lock_table.unlock();
+//        lock_table.unlock();
 
         char* data_ptrv = getDataByInternalId(internalId);
         size_t dim = *((size_t *) dist_func_param_);
@@ -908,7 +908,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             throw std::runtime_error("Label not found");
         }
         tableint internalId = search->second;
-        lock_table.unlock();
+//        lock_table.unlock();
 
         markDeletedInternal(internalId);
     }
@@ -950,7 +950,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             throw std::runtime_error("Label not found");
         }
         tableint internalId = search->second;
-        lock_table.unlock();
+//        lock_table.unlock();
 
         unmarkDeletedInternal(internalId);
     }
