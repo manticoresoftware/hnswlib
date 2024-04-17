@@ -1316,7 +1316,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t * ef = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -1350,13 +1350,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        size_t searchEf = std::max(ef_, k);
+        if ( ef )
+            searchEf = std::max(searchEf, *ef);
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         if (num_deleted_) {
             top_candidates = searchBaseLayerST<true, true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, searchEf, isIdAllowed);
         } else {
             top_candidates = searchBaseLayerST<false, true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, searchEf, isIdAllowed);
         }
 
         while (top_candidates.size() > k) {
