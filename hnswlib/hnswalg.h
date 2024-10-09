@@ -804,7 +804,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         // throw exception if it either corrupted or old index
-        if ( tReader.GetPos() != total_filesize)
+        if ( tReader.GetPos()>total_filesize )
         {
             error = "Index seems to be corrupted or unsupported";
             return false;
