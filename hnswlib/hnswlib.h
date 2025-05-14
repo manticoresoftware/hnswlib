@@ -25,7 +25,7 @@ static __int64 xgetbv(unsigned int x) {
 #include <x86intrin.h>
 #include <cpuid.h>
 #include <stdint.h>
-inline void cpuid(int32_t cpuInfo[4], int32_t eax, int32_t ecx) {
+static void cpuid(int32_t cpuInfo[4], int32_t eax, int32_t ecx) {
     __cpuid_count(eax, ecx, cpuInfo[0], cpuInfo[1], cpuInfo[2], cpuInfo[3]);
 }
 static uint64_t xgetbv(unsigned int index) {
@@ -140,7 +140,7 @@ static void readBinaryPOD(std::istream &in, T &podRef) {
 }
 
 template<typename MTYPE>
-using DISTFUNC = MTYPE(*)(const void *, const void *, const void *);
+using DISTFUNC = MTYPE(*)(const void *, const void *, size_t, size_t, const void *);
 
 template<typename MTYPE>
 class SpaceInterface {
