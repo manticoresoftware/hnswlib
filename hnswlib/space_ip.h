@@ -22,7 +22,7 @@ InnerProductDistance(const void *pVect1, const void *pVect2, size_t, size_t, con
 
 // Favor using AVX if available.
 static float
-InnerProductSIMD4ExtAVX(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+InnerProductSIMD4ExtAVX(const void *pVect1v, const void *pVect2v, size_t, size_t, const void *qty_ptr) {
     float PORTABLE_ALIGN32 TmpRes[8];
     float *pVect1 = (float *) pVect1v;
     float *pVect2 = (float *) pVect2v;
@@ -69,8 +69,8 @@ InnerProductSIMD4ExtAVX(const void *pVect1v, const void *pVect2v, const void *qt
 }
 
 static float
-InnerProductDistanceSIMD4ExtAVX(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
-    return 1.0f - InnerProductSIMD4ExtAVX(pVect1v, pVect2v, qty_ptr);
+InnerProductDistanceSIMD4ExtAVX(const void *pVect1v, const void *pVect2v, size_t, size_t, const void *qty_ptr) {
+    return 1.0f - InnerProductSIMD4ExtAVX(pVect1v, pVect2v, (size_t)-1, (size_t)-1, qty_ptr);
 }
 
 #endif
@@ -183,7 +183,7 @@ InnerProductDistanceSIMD16ExtAVX512(const void *pVect1v, const void *pVect2v, co
 #if defined(USE_AVX)
 
 static float
-InnerProductSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+InnerProductSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, size_t, size_t, const void *qty_ptr) {
     float PORTABLE_ALIGN32 TmpRes[8];
     float *pVect1 = (float *) pVect1v;
     float *pVect2 = (float *) pVect2v;
@@ -219,8 +219,8 @@ InnerProductSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, const void *q
 }
 
 static float
-InnerProductDistanceSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
-    return 1.0f - InnerProductSIMD16ExtAVX(pVect1v, pVect2v, qty_ptr);
+InnerProductDistanceSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, size_t, size_t, const void *qty_ptr) {
+    return 1.0f - InnerProductSIMD16ExtAVX(pVect1v, pVect2v, (size_t)-1, (size_t)-1, qty_ptr);
 }
 
 #endif

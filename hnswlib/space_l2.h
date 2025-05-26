@@ -58,7 +58,7 @@ L2SqrSIMD16ExtAVX512(const void *pVect1v, const void *pVect2v, const void *qty_p
 
 // Favor using AVX if available.
 static float
-L2SqrSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
+L2SqrSIMD16ExtAVX(const void *pVect1v, const void *pVect2v, size_t, size_t, const void *qty_ptr) {
     float *pVect1 = (float *) pVect1v;
     float *pVect2 = (float *) pVect2v;
     size_t qty = *((size_t *) qty_ptr);
