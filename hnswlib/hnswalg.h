@@ -131,20 +131,39 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
         if (linkLists_ == nullptr)
             throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
+        memset(linkLists_, 0, sizeof(void *) * max_elements_);
+
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
         revSize_ = 1.0 / mult_;
     }
 
+    void freeLinkLists() {
+        if (linkLists_ != nullptr) {
+            if (element_levels_.size() > 0) {
+                size_t iCount = element_levels_.size();
+                if (cur_element_count < element_levels_.size())
+                    iCount = cur_element_count;
+
+                for (tableint i = 0; i < iCount; i++) {
+                    if (element_levels_[i] > 0 && linkLists_[i] != nullptr) {
+                        free(linkLists_[i]);
+                    }
+                }
+            }
+            free(linkLists_);
+            linkLists_ = nullptr;
+        }
+    }
 
     ~HierarchicalNSW() {
-        free(data_level0_memory_);
-        for (tableint i = 0; i < cur_element_count; i++) {
-            if (element_levels_[i] > 0)
-                free(linkLists_[i]);
-        }
-        free(linkLists_);
-        delete visited_list_pool_;
+        if ( data_level0_memory_!=nullptr )
+            free ( data_level0_memory_ );
+        
+        freeLinkLists();
+        
+        if ( visited_list_pool_!=nullptr )
+            delete visited_list_pool_;
     }
 
 
@@ -833,6 +852,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             error = "Not enough memory: loadIndex failed to allocate linklists";
             return false;
         }
+        memset(linkLists_, 0, sizeof(void *) * max_elements_);
 
         element_levels_ = std::vector<int>(max_elements_);
         revSize_ = 1.0 / mult_;
