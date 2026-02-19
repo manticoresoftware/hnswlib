@@ -1,3 +1,7 @@
+// ACORN-1 implementation is based on Lucene's Java implementation:
+// https://github.com/apache/lucene/blob/main/lucene/core/src/java/org/apache/lucene/util/hnsw/FilteredHnswGraphSearcher.java
+// Licensed under the Apache License, Version 2.0.
+
 #pragma once
 
 #include "visited_list_pool.h"
@@ -6,6 +10,7 @@
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
+#include <cmath>
 #include <unordered_set>
 #include <list>
 
@@ -13,11 +18,22 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
-template<typename dist_t>
+class NoopTerminationState {
+public:
+    inline void reset() {}
+    inline void setEnabled( bool enabled ) {}
+    inline void onDistanceScored() {}
+    inline void onCandidateCollected() {}
+    inline bool shouldTerminate(size_t ef) { return false; }
+};
+
+template<typename dist_t, typename TerminationPolicy = NoopTerminationState>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
  public:
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
     static const unsigned char DELETE_MARK = 0x01;
+    static constexpr int DEFAULT_FILTERED_SEARCH_THRESHOLD = 60;
+    static constexpr float ACORN_EXPANDED_EXPLORATION_LAMBDA = 0.10f;
 
     size_t max_elements_{0};
     mutable std::atomic<size_t> cur_element_count{0};  // current number of elements
@@ -29,6 +45,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t maxM0_{0};
     size_t ef_construction_{0};
     size_t ef_{ 0 };
+    int filtered_search_threshold_{DEFAULT_FILTERED_SEARCH_THRESHOLD};
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -65,6 +82,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> metric_hops{0};
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
+
+    TerminationPolicy termination_policy_;
 
 //    std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
@@ -177,6 +196,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+    void setFilteredSearchThreshold ( int filtered_search_threshold )
+    {
+        if ( filtered_search_threshold < 0 || filtered_search_threshold > 100 )
+            throw std::runtime_error("filtered_search_threshold must be between 0 and 100");
+
+        filtered_search_threshold_ = filtered_search_threshold;
+    }
+
+    void setPatienceEnabled ( bool enabled )
+    {
+        termination_policy_.setEnabled(enabled);
     }
 
 
@@ -310,9 +342,72 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    float estimateFilterRatio ( BaseFilterFunctor * isIdAllowed ) const
+    {
+        if ( !isIdAllowed )
+            return 1.0f;
+
+        size_t total = cur_element_count.load();
+        if ( !total )
+            return 0.0f;
+
+        long long rawCount = isIdAllowed->getFilterCount();
+        if ( rawCount >= 0 )
+        {
+            size_t count = rawCount;
+            if ( count > total )
+                count = total;
+
+            return float(count) / total;
+        }
+
+        return 1.0f;
+    }
+
+    bool shouldUseAcorn ( BaseFilterFunctor * isIdAllowed ) const
+    {
+        if ( !isIdAllowed || filtered_search_threshold_ <= 0 || isIdAllowed->getFilterCount() < 0)
+            return false;
+
+        float ratio = estimateFilterRatio(isIdAllowed);
+        if ( ratio <= 0.0f )
+            return false;
+
+        return ratio * 100.0f < filtered_search_threshold_;
+    }
+
+    bool shouldBypassHnswForFilteredSearch ( size_t k, long long iFilterCount, size_t ef ) const
+    {
+        if ( iFilterCount < 0 )
+            return false;
+
+        size_t graphSize = cur_element_count.load();
+        if ( !graphSize )
+            return true;
+
+        size_t filteredCount = iFilterCount;
+        if ( filteredCount > graphSize )
+            filteredCount = graphSize;
+
+        if ( !filteredCount )
+            return true;
+
+        size_t searchEf = std::max ( std::max(ef_, k), ef );
+
+        bool doHnsw = k < filteredCount;
+        int unfilteredVisit = expectedVisitedNodes ( searchEf, graphSize );
+        if ( (size_t)unfilteredVisit >= filteredCount )
+            doHnsw = false;
+
+        return !doHnsw;
+    }
+
     template <bool has_deletions, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        if ( shouldUseAcorn(isIdAllowed) )
+            return searchBaseLayerSTFilteredAcorn<has_deletions, collect_metrics>(ep_id, data_point, ef, isIdAllowed);
+
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -332,6 +427,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_array[ep_id] = visited_array_tag;
+
+        TerminationPolicy termination_state = termination_policy_;
+        termination_state.reset();
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -371,6 +469,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, (labeltype)-1, getExternalLabel(candidate_id), dist_func_param_);
+                    termination_state.onDistanceScored();
 
                     if (top_candidates.size() < ef || lowerBound > dist) {
                         candidate_set.emplace(-dist, candidate_id);
@@ -381,7 +480,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #endif
 
                         if ((!has_deletions || !isMarkedDeleted(candidate_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))
+                        {
                             top_candidates.emplace(dist, candidate_id);
+                            termination_state.onCandidateCollected();
+                        }
 
                         if (top_candidates.size() > ef)
                             top_candidates.pop();
@@ -391,6 +493,187 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     }
                 }
             }
+
+            if ( termination_state.shouldTerminate(ef) )
+                break;
+        }
+
+        visited_list_pool_->releaseVisitedList(vl);
+        return top_candidates;
+    }
+
+    template <bool has_deletions, bool collect_metrics = false>
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchBaseLayerSTFilteredAcorn(
+        tableint ep_id,
+        const void *data_point,
+        size_t ef,
+        BaseFilterFunctor* isIdAllowed
+    ) const {
+        VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+        vl_type *visited_array = vl->mass;
+        vl_type visited_array_tag = vl->curV;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+
+        auto isAllowed = [&](tableint id) -> bool
+        {
+            return isIdAllowed == nullptr || (*isIdAllowed)(getExternalLabel(id));
+        };
+
+        dist_t lowerBound = std::numeric_limits<dist_t>::max();
+        dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), (labeltype)-1, getExternalLabel(ep_id), dist_func_param_);
+        candidate_set.emplace(-dist, ep_id);
+        if ((!has_deletions || !isMarkedDeleted(ep_id)) && isAllowed(ep_id))
+        {
+            lowerBound = dist;
+            top_candidates.emplace(dist, ep_id);
+        }
+
+        visited_array[ep_id] = visited_array_tag;
+
+        float filter_ratio = estimateFilterRatio(isIdAllowed);
+        float min_ratio = 1.0f / std::max<size_t>(cur_element_count.load(), 1);
+        if (filter_ratio < min_ratio)
+            filter_ratio = min_ratio;
+
+        float inverse_ratio = 1.0f / filter_ratio;
+        int maxExplorationMultiplier = (int)std::min(inverse_ratio, (float)maxM0_ / 2.0f);
+        if (maxExplorationMultiplier < 1)
+            maxExplorationMultiplier = 1;
+
+        int minToScore = (int)std::min(std::max(0.0f, inverse_ratio - (2.0f * maxM0_)), (float)maxM0_);
+
+        std::vector<tableint> toScore;
+        std::vector<tableint> toExplore;
+        size_t queue_capacity = maxM0_ * 2 * maxExplorationMultiplier;
+        toScore.reserve(queue_capacity);
+        toExplore.reserve(queue_capacity);
+
+        TerminationPolicy termination_state = termination_policy_;
+        termination_state.reset();
+
+        while ( !candidate_set.empty() )
+        {
+            std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
+            if ((-current_node_pair.first) > lowerBound && top_candidates.size() == ef)
+                break;
+
+            candidate_set.pop();
+
+            tableint current_node_id = current_node_pair.second;
+            int *data = (int *) get_linklist0(current_node_id);
+            size_t size = getListCount((linklistsizeint*)data);
+
+            if (collect_metrics)
+                metric_hops++;
+
+            toScore.clear();
+            toExplore.clear();
+            size_t exploreUpto = 0;
+
+#ifdef USE_SSE
+            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
+            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
+#endif
+            for (size_t j = 1; j <= size; j++)
+            {
+                int candidate_id = *(data + j);
+#ifdef USE_SSE
+                _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
+                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+#endif
+                if (visited_array[candidate_id] == visited_array_tag)
+                    continue;
+
+                visited_array[candidate_id] = visited_array_tag;
+
+                bool allowed = isAllowed(candidate_id);
+                bool deleted = has_deletions && isMarkedDeleted(candidate_id);
+                if (allowed || deleted)
+                    toScore.push_back(candidate_id);
+                else
+                    toExplore.push_back(candidate_id);
+            }
+
+            if ( !toExplore.empty() )
+            {
+                float filteredAmount = size == 0 ? 0.0f : (float)toExplore.size() / size;
+                float denom = std::max(1e-6f, 1.0f - filteredAmount);
+                int maxToScoreCount = int(size * std::min((float)maxExplorationMultiplier, 1.0f / denom) );
+
+                if ( (int)toScore.size() < maxToScoreCount && filteredAmount > ACORN_EXPANDED_EXPLORATION_LAMBDA )
+                {
+                    size_t maxAdditionalToExploreCount = toExplore.capacity() > 0 ? (toExplore.capacity() - 1) : 0;
+                    size_t totalExplored = toScore.size() + toExplore.size();
+                    while (exploreUpto < toExplore.size()
+                        && totalExplored < maxAdditionalToExploreCount
+                        && (int)toScore.size() < maxToScoreCount)
+                    {
+                        tableint exploreNeighbor = toExplore[exploreUpto++];
+                        int *exploreData = (int *) get_linklist0(exploreNeighbor);
+                        size_t exploreSize = getListCount((linklistsizeint*)exploreData);
+#ifdef USE_SSE
+                        _mm_prefetch((char *) (visited_array + *(exploreData + 1)), _MM_HINT_T0);
+                        _mm_prefetch((char *) (visited_array + *(exploreData + 1) + 64), _MM_HINT_T0);
+                        _mm_prefetch(data_level0_memory_ + (*(exploreData + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+                        _mm_prefetch((char *) (exploreData + 2), _MM_HINT_T0);
+#endif
+                        for (size_t k = 1; k <= exploreSize && (int)toScore.size() < maxToScoreCount; k++)
+                        {
+                            int neighborOfNeighbor = *(exploreData + k);
+#ifdef USE_SSE
+                            _mm_prefetch((char *) (visited_array + *(exploreData + k + 1)), _MM_HINT_T0);
+                            _mm_prefetch(data_level0_memory_ + (*(exploreData + k + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+#endif
+                            if (visited_array[neighborOfNeighbor] == visited_array_tag)
+                                continue;
+
+                            visited_array[neighborOfNeighbor] = visited_array_tag;
+                            totalExplored++;
+                            bool allowed = isAllowed(neighborOfNeighbor);
+                            bool deleted = has_deletions && isMarkedDeleted(neighborOfNeighbor);
+                            if (allowed || deleted)
+                                toScore.push_back(neighborOfNeighbor);
+                            else if (totalExplored < maxAdditionalToExploreCount && (int)toScore.size() < minToScore)
+                                toExplore.push_back(neighborOfNeighbor);
+                        }
+                    }
+                }
+            }
+
+            if (collect_metrics)
+                metric_distance_computations += toScore.size();
+
+            for ( auto candidate_id : toScore )
+            {
+                char *currObj1 = (getDataByInternalId(candidate_id));
+                dist_t dist = fstdistfunc_(data_point, currObj1, (labeltype)-1, getExternalLabel(candidate_id), dist_func_param_);
+                termination_state.onDistanceScored();
+
+                if (top_candidates.size() < ef || lowerBound > dist)
+                {
+                    candidate_set.emplace(-dist, candidate_id);
+                    bool allowed = isAllowed(candidate_id);
+                    bool deleted = has_deletions && isMarkedDeleted(candidate_id);
+                    if (!deleted && allowed)
+                    {
+                        top_candidates.emplace(dist, candidate_id);
+                        termination_state.onCandidateCollected();
+                        if (top_candidates.size() > ef)
+                            top_candidates.pop();
+
+                        if (!top_candidates.empty())
+                            lowerBound = top_candidates.top().first;
+                    }
+                }
+            }
+
+            if ( termination_state.shouldTerminate(ef) )
+                break;
         }
 
         visited_list_pool_->releaseVisitedList(vl);
@@ -1418,6 +1701,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             std::cout << "Min inbound: " << min1 << ", Max inbound:" << max1 << "\n";
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
+    }
+
+private:
+    static int expectedVisitedNodes ( size_t k, size_t graphSize )
+	{
+        if ( !k || graphSize <= 1)
+            return 0;
+
+        return int(log((double)graphSize) * (double)k);
     }
 };
 }  // namespace hnswlib

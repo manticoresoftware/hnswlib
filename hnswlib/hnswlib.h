@@ -119,6 +119,8 @@ typedef size_t labeltype;
 class BaseFilterFunctor {
  public:
     virtual bool operator()(hnswlib::labeltype id) { return true; }
+    // Return -1 when filter cardinality is unknown.
+    virtual long long getFilterCount() const { return -1; }
 };
 
 template <typename T>
