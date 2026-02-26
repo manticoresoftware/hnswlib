@@ -1709,7 +1709,7 @@ private:
         if ( !k || graphSize <= 1)
             return 0;
 
-        return int(log((double)graphSize) * (double)k);
+        return int(log((double)graphSize) * (double)std::min(k, graphSize));
     }
 };
 }  // namespace hnswlib
