@@ -1604,11 +1604,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr,
         size_t * ef = nullptr) const override {
-        return searchKnn<NoopTerminationState>(query_data, k, isIdAllowed, ef);
+        return searchKnn<NoopTerminationState, false>(query_data, k, isIdAllowed, ef);
     }
 
 
-    template <typename TerminationPolicy = NoopTerminationState>
+    template <typename TerminationPolicy = NoopTerminationState, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr,
         size_t * ef = nullptr) const {
@@ -1626,8 +1626,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 data = (unsigned int *) get_linklist(currObj, level);
                 int size = getListCount(data);
-                metric_hops++;
-                metric_distance_computations+=size;
+                if constexpr (collect_metrics) {
+                    metric_hops++;
+                    metric_distance_computations += size;
+                }
 
                 tableint *datal = (tableint *) (data + 1);
                 for (int i = 0; i < size; i++) {
@@ -1650,10 +1652,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             searchEf = std::max(searchEf, *ef);
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         if (num_deleted_) {
-            top_candidates = searchBaseLayerST<TerminationPolicy, true, true>(
+            top_candidates = searchBaseLayerST<TerminationPolicy, true, collect_metrics>(
                     currObj, query_data, searchEf, isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<TerminationPolicy, false, true>(
+            top_candidates = searchBaseLayerST<TerminationPolicy, false, collect_metrics>(
                     currObj, query_data, searchEf, isIdAllowed);
         }
 
