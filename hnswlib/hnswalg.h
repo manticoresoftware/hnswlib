@@ -24,10 +24,10 @@ public:
     inline void setEnabled( bool enabled ) {}
     inline void onDistanceScored() {}
     inline void onCandidateCollected() {}
-    inline bool shouldTerminate(size_t ef) { return false; }
+    inline bool shouldTerminate(size_t ef, size_t current_size) { return false; }
 };
 
-template<typename dist_t, typename TerminationPolicy = NoopTerminationState>
+template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
  public:
     static const tableint MAX_LABEL_OPERATION_LOCKS = 65536;
@@ -82,8 +82,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> metric_hops{0};
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
-
-    TerminationPolicy termination_policy_;
 
 //    std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
@@ -205,12 +203,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         filtered_search_threshold_ = filtered_search_threshold;
     }
-
-    void setPatienceEnabled ( bool enabled )
-    {
-        termination_policy_.setEnabled(enabled);
-    }
-
 
 /*    inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -402,11 +394,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return !doHnsw;
     }
 
-    template <bool has_deletions, bool collect_metrics = false>
+    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef, BaseFilterFunctor* isIdAllowed = nullptr) const {
         if ( shouldUseAcorn(isIdAllowed) )
-            return searchBaseLayerSTFilteredAcorn<has_deletions, collect_metrics>(ep_id, data_point, ef, isIdAllowed);
+            return searchBaseLayerSTFilteredAcorn<TerminationPolicy, has_deletions, collect_metrics>(ep_id, data_point, ef, isIdAllowed);
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
@@ -428,8 +420,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
-        TerminationPolicy termination_state = termination_policy_;
-        termination_state.reset();
+        TerminationPolicy termination_state;
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -494,7 +485,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
 
-            if ( termination_state.shouldTerminate(ef) )
+            if ( termination_state.shouldTerminate(ef, top_candidates.size()) )
                 break;
         }
 
@@ -502,7 +493,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
-    template <bool has_deletions, bool collect_metrics = false>
+    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayerSTFilteredAcorn(
         tableint ep_id,
@@ -551,8 +542,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         toScore.reserve(queue_capacity);
         toExplore.reserve(queue_capacity);
 
-        TerminationPolicy termination_state = termination_policy_;
-        termination_state.reset();
+        TerminationPolicy termination_state;
 
         while ( !candidate_set.empty() )
         {
@@ -672,7 +662,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
 
-            if ( termination_state.shouldTerminate(ef) )
+            if ( termination_state.shouldTerminate(ef, top_candidates.size()) )
                 break;
         }
 
@@ -1611,9 +1601,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return cur_c;
     }
 
-
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t * ef = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr,
+        size_t * ef = nullptr) const override {
+        return searchKnn<NoopTerminationState>(query_data, k, isIdAllowed, ef);
+    }
+
+
+    template <typename TerminationPolicy = NoopTerminationState>
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr,
+        size_t * ef = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -1652,10 +1650,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             searchEf = std::max(searchEf, *ef);
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         if (num_deleted_) {
-            top_candidates = searchBaseLayerST<true, true>(
+            top_candidates = searchBaseLayerST<TerminationPolicy, true, true>(
                     currObj, query_data, searchEf, isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<false, true>(
+            top_candidates = searchBaseLayerST<TerminationPolicy, false, true>(
                     currObj, query_data, searchEf, isIdAllowed);
         }
 
