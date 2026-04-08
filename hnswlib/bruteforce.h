@@ -97,11 +97,12 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
     }
 
 
-    std::priority_queue<std::pair<dist_t, labeltype >>
+    std::vector<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t * = nullptr) const {
         assert(k <= cur_element_count);
         std::priority_queue<std::pair<dist_t, labeltype >> topResults;
-        if (cur_element_count == 0) return topResults;
+        std::vector<std::pair<dist_t, labeltype >> result;
+        if (cur_element_count == 0) return result;
         for (int i = 0; i < k; i++) {
             dist_t dist = fstdistfunc_(query_data, data_ + size_per_element_ * i, dist_func_param_);
             labeltype label = *((labeltype*) (data_ + size_per_element_ * i + data_size_));
@@ -125,7 +126,12 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
                 }
             }
         }
-        return topResults;
+        result.reserve(topResults.size());
+        while (!topResults.empty()) {
+            result.emplace_back(topResults.top());
+            topResults.pop();
+        }
+        return result;
     }
 
 

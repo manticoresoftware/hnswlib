@@ -162,7 +162,7 @@ class AlgorithmInterface {
  public:
     virtual void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) = 0;
 
-    virtual std::priority_queue<std::pair<dist_t, labeltype>>
+    virtual std::vector<std::pair<dist_t, labeltype>>
         searchKnn(const void*, size_t, BaseFilterFunctor* isIdAllowed = nullptr, size_t * ef = nullptr) const = 0;
 
     // Return k nearest neighbor in the order of closer fist
@@ -182,14 +182,7 @@ AlgorithmInterface<dist_t>::searchKnnCloserFirst(const void* query_data, size_t 
 
     // here searchKnn returns the result in the order of further first
     auto ret = searchKnn(query_data, k, isIdAllowed);
-    {
-        size_t sz = ret.size();
-        result.resize(sz);
-        while (!ret.empty()) {
-            result[--sz] = ret.top();
-            ret.pop();
-        }
-    }
+    result.assign(ret.rbegin(), ret.rend());
 
     return result;
 }
