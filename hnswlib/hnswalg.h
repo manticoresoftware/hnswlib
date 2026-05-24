@@ -286,6 +286,62 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
+    template <class DistFn = void>
+    inline dist_t calcDistanceConstruction ( const void * query_data, tableint internal_id, labeltype query_label ) const
+    {
+        if constexpr ( std::is_same_v<DistFn, void> )
+        {
+            return fstdistfunc_(
+                query_data,
+                getDataByInternalId(internal_id),
+                query_label,
+                getExternalLabel(internal_id),
+                dist_func_param_ );
+        }
+        else
+        {
+            return DistFn::Eval(
+                query_data,
+                getDataByInternalId(internal_id),
+                (size_t)query_label,
+                internal_id,
+                dist_func_param_ );
+        }
+    }
+
+    template <class DistFn = void>
+    inline void calcDistance2Construction ( const void * query_data, tableint internal_id_a, tableint internal_id_b, labeltype query_label, dist_t & dist_a, dist_t & dist_b ) const
+    {
+        if constexpr ( std::is_same_v<DistFn, void> )
+        {
+            dist_a = fstdistfunc_(
+                query_data,
+                getDataByInternalId(internal_id_a),
+                query_label,
+                getExternalLabel(internal_id_a),
+                dist_func_param_ );
+            dist_b = fstdistfunc_(
+                query_data,
+                getDataByInternalId(internal_id_b),
+                query_label,
+                getExternalLabel(internal_id_b),
+                dist_func_param_ );
+        }
+        else
+        {
+            DistFn::Eval2(
+                query_data,
+                getDataByInternalId(internal_id_a),
+                getDataByInternalId(internal_id_b),
+                (size_t)query_label,
+                internal_id_a,
+                internal_id_b,
+                dist_func_param_,
+                dist_a,
+                dist_b );
+        }
+    }
+
     inline void setExternalLabel(tableint internal_id, labeltype label) const {
         memcpy((data_level0_memory_ + internal_id * size_data_per_element_ + label_offset_), &label, sizeof(labeltype));
     }
@@ -324,29 +380,57 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
-    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    template <class DistFn = void, bool has_deletions = true>
+    CandidateQueue_t
     searchBaseLayer(tableint ep_id, const void *data_point, int layer, labeltype label) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
+        CandidateQueue_t top_candidates;
+        CandidateQueue_t candidateSet;
 
         dist_t lowerBound;
-        if (!isMarkedDeleted(ep_id)) {
-            dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), label, getExternalLabel(ep_id), dist_func_param_);
+        if constexpr (has_deletions) {
+            if (!isMarkedDeleted(ep_id)) {
+                dist_t dist = calcDistanceConstruction<DistFn>(data_point, ep_id, label);
+                top_candidates.emplace(dist, ep_id);
+                lowerBound = dist;
+                candidateSet.emplace(-dist, ep_id);
+            } else {
+                lowerBound = std::numeric_limits<dist_t>::max();
+                candidateSet.emplace(-lowerBound, ep_id);
+            }
+        } else {
+            dist_t dist = calcDistanceConstruction<DistFn>(data_point, ep_id, label);
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             candidateSet.emplace(-dist, ep_id);
-        } else {
-            lowerBound = std::numeric_limits<dist_t>::max();
-            candidateSet.emplace(-lowerBound, ep_id);
         }
         visited_array[ep_id] = visited_array_tag;
 
+        // local batch buffer for unvisited neighbors gathered in Pass 1; spills to heap for unusually large M
+        tableint dLocalBatch[64];
+        std::vector<tableint> dBatchOverflow;
+
+        auto fnUpdate = [&] ( tableint candidate_id, dist_t dist ) {
+            if (top_candidates.size() < ef_construction_ || lowerBound > dist) {
+                candidateSet.emplace(-dist, candidate_id);
+                if constexpr (has_deletions) {
+                    if (!isMarkedDeleted(candidate_id))
+                        top_candidates.emplace(dist, candidate_id);
+                } else {
+                    top_candidates.emplace(dist, candidate_id);
+                }
+                if (top_candidates.size() > ef_construction_)
+                    top_candidates.pop();
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.top().first;
+            }
+        };
+
         while (!candidateSet.empty()) {
-            std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
+            CandidatePair_t curr_el_pair = candidateSet.top();
             if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
                 break;
             }
@@ -354,51 +438,55 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            // Pass 1: under curNodeNum's link list lock, gather unvisited candidates into pBatch and prefetch their vector data
+			// lock is released before pass 2
+            std::unique_lock<std::mutex> lock(link_list_locks_[curNodeNum]);
 
-            int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
-            if (layer == 0) {
-                data = (int*)get_linklist0(curNodeNum);
-            } else {
-                data = (int*)get_linklist(curNodeNum, layer);
-//                    data = (int *) (linkLists_[curNodeNum] + (layer - 1) * size_links_per_element_);
-            }
+            int *data = (layer == 0) ? (int*)get_linklist0(curNodeNum) : (int*)get_linklist(curNodeNum, layer);
             size_t size = getListCount((linklistsizeint*)data);
-            tableint *datal = (tableint *) (data + 1);
+            tableint *datal = (tableint *)(data + 1);
+
 #ifdef USE_SSE
-            _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
-            _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(getDataByInternalId(*datal), _MM_HINT_T0);
-            _mm_prefetch(getDataByInternalId(*(datal + 1)), _MM_HINT_T0);
+            if (!candidateSet.empty())
+                _mm_prefetch(data_level0_memory_ + (size_t)candidateSet.top().second * size_data_per_element_ + offsetLevel0_, _MM_HINT_T0);
+            for (size_t j = 0; j < size; j++)
+                _mm_prefetch((char *)(visited_array + datal[j]), _MM_HINT_T0);
 #endif
 
+            tableint *pBatch = dLocalBatch;
+            if (size > std::size(dLocalBatch)) {
+                dBatchOverflow.resize(size);
+                pBatch = dBatchOverflow.data();
+            }
+            size_t iBatchSize = 0;
             for (size_t j = 0; j < size; j++) {
-                tableint candidate_id = *(datal + j);
-//                    if (candidate_id == 0) continue;
+                tableint candidate_id = datal[j];
+                if (visited_array[candidate_id] != visited_array_tag) {
+                    visited_array[candidate_id] = visited_array_tag;
+                    pBatch[iBatchSize++] = candidate_id;
 #ifdef USE_SSE
-                _mm_prefetch((char *) (visited_array + *(datal + j + 1)), _MM_HINT_T0);
-                _mm_prefetch(getDataByInternalId(*(datal + j + 1)), _MM_HINT_T0);
+                    _mm_prefetch(getDataByInternalId(candidate_id), _MM_HINT_T0);
 #endif
-                if (visited_array[candidate_id] == visited_array_tag) continue;
-                visited_array[candidate_id] = visited_array_tag;
-                char *currObj1 = (getDataByInternalId(candidate_id));
-
-                dist_t dist1 = fstdistfunc_(data_point, currObj1, label, getExternalLabel(candidate_id), dist_func_param_);
-                if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
-                    candidateSet.emplace(-dist1, candidate_id);
-#ifdef USE_SSE
-                    _mm_prefetch(getDataByInternalId(candidateSet.top().second), _MM_HINT_T0);
-#endif
-
-                    if (!isMarkedDeleted(candidate_id))
-                        top_candidates.emplace(dist1, candidate_id);
-
-                    if (top_candidates.size() > ef_construction_)
-                        top_candidates.pop();
-
-                    if (!top_candidates.empty())
-                        lowerBound = top_candidates.top().first;
                 }
+            }
+
+            // Pass 2 is lock-free: a candidate's vector is written before it appears in any link list,
+            // and the curNodeNum lock acquire above gives the matching happens-before. Assumes no concurrent updatePoint()
+            lock.unlock();
+
+            // Pass 2: distances + heap updates
+            size_t b = 0;
+            for ( ; b + 1 < iBatchSize; b += 2 ) {
+                tableint a = pBatch[b], c = pBatch[b + 1];
+                dist_t distA, distC;
+                calcDistance2Construction<DistFn>(data_point, a, c, label, distA, distC);
+                fnUpdate(a, distA);
+                fnUpdate(c, distC);
+            }
+            for ( ; b < iBatchSize; b++ ) {
+                tableint a = pBatch[b];
+                dist_t distA = calcDistanceConstruction<DistFn>(data_point, a, label);
+                fnUpdate(a, distA);
             }
         }
         visited_list_pool_->releaseVisitedList(vl);
@@ -829,6 +917,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    template <class DistFn = void>
     void getNeighborsByHeuristic2(
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
     const size_t M) {
@@ -852,7 +941,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             bool good = true;
 
             for (std::pair<dist_t, tableint> second_pair : return_list) {
-                dist_t curdist = fstdistfunc_ ( getDataByInternalId(second_pair.second), getDataByInternalId(curent_pair.second), getExternalLabel(second_pair.second), getExternalLabel(curent_pair.second), dist_func_param_ );
+                dist_t curdist = calcDistanceConstruction<DistFn>(getDataByInternalId(second_pair.second), curent_pair.second, getExternalLabel(second_pair.second));
                 if (curdist < dist_to_query) {
                     good = false;
                     break;
@@ -889,6 +978,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    template <class DistFn = void>
     tableint mutuallyConnectNewElement(
         const void *data_point,
         tableint cur_c,
@@ -896,7 +986,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         int level,
         bool isUpdate) {
         size_t Mcurmax = level ? maxM_ : maxM0_;
-        getNeighborsByHeuristic2(top_candidates, M_);
+        getNeighborsByHeuristic2<DistFn>(top_candidates, M_);
         if (top_candidates.size() > M_)
             throw std::runtime_error("Should be not be more than M_ candidates returned by the heuristic");
 
@@ -973,19 +1063,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     data[sz_link_list_other] = cur_c;
                     setListCount(ll_other, sz_link_list_other + 1);
                 } else {
-                    // finding the "weakest" element to replace it with the new one
-                    dist_t d_max = fstdistfunc_(getDataByInternalId(cur_c), getDataByInternalId(selectedNeighbors[idx]), getExternalLabel(cur_c), getExternalLabel(selectedNeighbors[idx]), dist_func_param_);
+                    // finding the "weakest" element to replace it with the new one.
+                    dist_t d_max = calcDistanceConstruction<DistFn>(getDataByInternalId(cur_c), selectedNeighbors[idx], getExternalLabel(cur_c));
                     // Heuristic:
                     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidates;
                     candidates.emplace(d_max, cur_c);
 
                     for (size_t j = 0; j < sz_link_list_other; j++) {
                         candidates.emplace(
-                            fstdistfunc_(getDataByInternalId(data[j]), getDataByInternalId(selectedNeighbors[idx]), getExternalLabel(data[j]), getExternalLabel(selectedNeighbors[idx]), dist_func_param_)
-                            , data[j]);
+                            calcDistanceConstruction<DistFn>(getDataByInternalId(data[j]), selectedNeighbors[idx], getExternalLabel(data[j])),
+                            data[j]);
                     }
 
-                    getNeighborsByHeuristic2(candidates, Mcurmax);
+                    getNeighborsByHeuristic2<DistFn>(candidates, Mcurmax);
 
                     int indx = 0;
                     while (candidates.size() > 0) {
@@ -1454,7 +1544,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // lock all operations with element by label
         //std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
         if (!replace_deleted) {
-            addPoint(data_point, label, -1);
+            addPoint<void, false>(data_point, label, -1);
             return;
         }
         // check if there is vacant place
@@ -1470,7 +1560,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // if there is no vacant place then add or update point
         // else add point to vacant place
         if (!is_vacant_place) {
-            addPoint(data_point, label, -1);
+            addPoint<void, false>(data_point, label, -1);
         } else {
             // we assume that there are no concurrent operations on deleted element
             labeltype label_replaced = getExternalLabel(internal_id_replaced);
@@ -1644,6 +1734,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    template <class DistFn = void, bool has_deletions = true>
     tableint addPoint(const void *data_point, labeltype label, int level) {
         tableint cur_c = 0;
         {
@@ -1706,44 +1797,71 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if ((signed)currObj != -1) {
             if (curlevel < maxlevelcopy) {
-                dist_t curdist = fstdistfunc_(data_point, getDataByInternalId(currObj), label, getExternalLabel(currObj), dist_func_param_);
+                dist_t curdist = calcDistanceConstruction<DistFn>(data_point, currObj, label);
+
+                tableint candBuf[64];
+                std::vector<tableint> candOverflow;
+
                 for (int level = maxlevelcopy; level > curlevel; level--) {
                     bool changed = true;
                     while (changed) {
                         changed = false;
-                        unsigned int *data;
-                        std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
-                        data = get_linklist(currObj, level);
-                        int size = getListCount(data);
 
-                        tableint *datal = (tableint *) (data + 1);
-                        for (int i = 0; i < size; i++) {
-                            tableint cand = datal[i];
+                        size_t copiedSize;
+                        tableint *candList;
+                        {
+                            std::unique_lock<std::mutex> lock(link_list_locks_[currObj]);
+                            unsigned int *data = get_linklist(currObj, level);
+                            copiedSize = (size_t)getListCount(data);
+                            tableint *datal = (tableint *)(data + 1);
+                            if (copiedSize > std::size(candBuf)) {
+                                candOverflow.resize(copiedSize);
+                                candList = candOverflow.data();
+                            } else {
+                                candList = candBuf;
+                            }
+                            for (size_t i = 0; i < copiedSize; i++)
+                                candList[i] = datal[i];
+                        }
+
+                        size_t i = 0;
+                        for ( ; i + 1 < copiedSize; i += 2 ) {
+                            tableint candA = candList[i], candB = candList[i + 1];
+                            if (candA < 0 || candA > max_elements_ || candB < 0 || candB > max_elements_)
+                                throw std::runtime_error("cand error");
+                            dist_t dA, dB;
+                            calcDistance2Construction<DistFn>(data_point, candA, candB, label, dA, dB);
+                            if (dA < curdist) { curdist = dA; currObj = candA; changed = true; }
+                            if (dB < curdist) { curdist = dB; currObj = candB; changed = true; }
+                        }
+                        for ( ; i < copiedSize; i++ ) {
+                            tableint cand = candList[i];
                             if (cand < 0 || cand > max_elements_)
                                 throw std::runtime_error("cand error");
-                            dist_t d = fstdistfunc_(data_point, getDataByInternalId(cand), label, getExternalLabel(cand), dist_func_param_);
-                            if (d < curdist) {
-                                curdist = d;
-                                currObj = cand;
-                                changed = true;
-                            }
+                            dist_t d = calcDistanceConstruction<DistFn>(data_point, cand, label);
+                            if (d < curdist) { curdist = d; currObj = cand; changed = true; }
                         }
                     }
                 }
             }
 
-            bool epDeleted = isMarkedDeleted(enterpoint_copy);
+            [[maybe_unused]] bool epDeleted = false;
+            if constexpr (has_deletions)
+                epDeleted = isMarkedDeleted(enterpoint_copy);
+
             for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--) {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
 
-                std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer ( currObj, data_point, level, label );
-                if (epDeleted) {
-                    top_candidates.emplace(fstdistfunc_(data_point, getDataByInternalId(enterpoint_copy), (labeltype)-1, getExternalLabel(enterpoint_copy), dist_func_param_), enterpoint_copy);
-                    if (top_candidates.size() > ef_construction_)
-                        top_candidates.pop();
+                CandidateQueue_t top_candidates = searchBaseLayer<DistFn, has_deletions>( currObj, data_point, level, label );
+                if constexpr (has_deletions) {
+                    if (epDeleted) {
+                        top_candidates.emplace(calcDistance<DistFn>(data_point, enterpoint_copy), enterpoint_copy);
+                        if (top_candidates.size() > ef_construction_)
+                            top_candidates.pop();
+                    }
                 }
-                currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false);
+                currObj = mutuallyConnectNewElement<DistFn>(data_point, cur_c, top_candidates, level, false);
             }
         } else {
             // Do nothing for the first element
