@@ -14,6 +14,7 @@
 #include <cmath>
 #include <unordered_set>
 #include <list>
+#include <set>
 #include <type_traits>
 
 namespace hnswlib {
@@ -48,6 +49,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t ef_construction_{0};
     size_t ef_{ 0 };
     int filtered_search_threshold_{DEFAULT_FILTERED_SEARCH_THRESHOLD};
+
+    // Optional label -> group map, indexed by external label. When set, search collects one result
+    // per group instead of one per label, and returns group ids in place of labels.
+    const uint32_t * group_map_{nullptr};
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -204,9 +209,102 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     using CandidatePair_t = std::pair<dist_t, tableint>;
     using CandidateQueue_t = std::priority_queue<CandidatePair_t, std::vector<CandidatePair_t>, CompareByFirst>;
 
+    // Used only when a group map is set, i.e. when several labels can belong to the same group (one document owning many vectors).
+	// The list then holds up to `ef` distinct, each represented by its single best entry.
+    class GroupedCandidates_t
+    {
+    public:
+        GroupedCandidates_t ( const HierarchicalNSW * idx, const uint32_t * group_map )
+            : idx_(idx), group_map_(group_map) {}
+
+        size_t size() const { return entries_.size(); }
+        bool empty() const { return entries_.empty(); }
+
+        uint32_t groupOf ( tableint id ) const { return group_map_[idx_->getExternalLabel(id)]; }
+
+        // returns true if the list changed, i.e. wherever the plain heap would have been pushed.
+        // Callers use this to drive the termination policy's admission counter.
+        bool push ( dist_t dist, tableint id ) {
+			// check for NaN
+            if ( dist != dist )
+                dist = std::numeric_limits<dist_t>::max();
+
+            uint32_t g = groupOf(id);
+            auto it = pos_.find(g);
+            if (it == pos_.end()) {
+                pos_.emplace ( g, entries_.insert ( Entry_t{dist, g} ).first );
+                return true;
+            }
+            if (dist < it->second->dist) {
+                entries_.erase ( it->second );
+                it->second = entries_.insert ( Entry_t{dist, g} ).first;
+                return true;
+            }
+            return false;   // a worse duplicate of a group we already hold: dropped
+        }
+
+        // distance of the farthest group; only valid when !empty()
+        dist_t farthest() const { return std::prev(entries_.end())->dist; }
+
+        void popFarthest() {
+            if (entries_.empty()) return;
+            auto it = std::prev ( entries_.end() );
+            pos_.erase ( it->group );
+            entries_.erase(it);
+        }
+
+        // farthest group as (best distance, group id)
+        bool popResult ( dist_t & dist, labeltype & label ) {
+            if (entries_.empty()) return false;
+            auto it = std::prev ( entries_.end() );
+            dist = it->dist;
+            label = (labeltype)it->group;
+            pos_.erase ( it->group );
+            entries_.erase(it);
+            return true;
+        }
+
+    private:
+        struct Entry_t { dist_t dist; uint32_t group; };
+        struct CompareEntry_t {
+            // one entry per group is enforced in push()'s job, here we are only comparing different groups with potentially equal distances
+            bool operator() ( const Entry_t & a, const Entry_t & b ) const {
+                if ( a.dist < b.dist ) return true;
+                if ( b.dist < a.dist ) return false;
+                return a.group < b.group;
+            }
+        };
+        using Entries_t = std::set<Entry_t, CompareEntry_t>;
+
+        const HierarchicalNSW * idx_ = nullptr;
+        const uint32_t * group_map_ = nullptr;
+        Entries_t entries_;                                     // ordered by distance, one per group
+        std::unordered_map<uint32_t, typename Entries_t::iterator> pos_;
+    };
+
+    template <class ResultList>
+    ResultList makeResultList() const {
+        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+            return GroupedCandidates_t ( this, group_map_ );
+        else
+            return ResultList();
+    }
+
+    template <class ResultList>
+    static void pushSeed ( ResultList & tList, dist_t dist, tableint id ) {
+        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+            tList.push(dist, id);
+        else
+            tList.emplace(dist, id);
+    }
+
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+    void setGroupMap ( const uint32_t * pGroupMap ) {
+        group_map_ = pGroupMap;
     }
 
     void setFilteredSearchThreshold ( int filtered_search_threshold )
@@ -536,7 +634,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         size_t graphSize = cur_element_count.load();
         if ( !graphSize )
-            return true;
+            return false;   // searchKnn returns immediately on an empty graph, so a scan is never cheaper
 
         size_t filteredCount = iFilterCount;
         if ( filteredCount > graphSize )
@@ -555,9 +653,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return !doHnsw;
     }
 
-    template <typename TerminationPolicy, class AllowTopCandidateFn>
+    // ResultList is deduced: CandidateQueue_t for an ordinary search, GroupedCandidates_t when a group map is used
+    template <typename TerminationPolicy, class ResultList, class AllowTopCandidateFn>
     inline void processScoredCandidate (
-        CandidateQueue_t & top_candidates,
+        ResultList & top_candidates,
         CandidateQueue_t & candidate_set,
         dist_t & lowerBound,
         size_t ef,
@@ -571,26 +670,42 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (top_candidates.size() < ef || lowerBound > dist) {
             candidate_set.emplace(-dist, candidate_id);
 
-            if (fnAllowTopCandidate(candidate_id)) {
-                top_candidates.emplace(dist, candidate_id);
-                termination_state.onCandidateCollected();
+            if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+            {
+                // fires on a new group and on an improvement to an existing one
+                if (fnAllowTopCandidate(candidate_id) && top_candidates.push(dist, candidate_id))
+                    termination_state.onCandidateCollected();
+
+                if (top_candidates.size() > ef)
+                    top_candidates.popFarthest();
+
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.farthest();
             }
+            else
+            {
+                if (fnAllowTopCandidate(candidate_id))
+				{
+                    top_candidates.emplace(dist, candidate_id);
+                    termination_state.onCandidateCollected();
+                }
 
-            if (top_candidates.size() > ef)
-                top_candidates.pop();
+                if (top_candidates.size() > ef)
+                    top_candidates.pop();
 
-            if (!top_candidates.empty())
-                lowerBound = top_candidates.top().first;
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.top().first;
+            }
         }
     }
 
-    template <typename TerminationPolicy, bool collect_metrics = false, class DistFn = void, class AllowTopCandidateFn>
+    template <typename TerminationPolicy, bool collect_metrics = false, class DistFn = void, class ResultList, class AllowTopCandidateFn>
     inline void searchBaseLayerPass12 (
         const void * data_point,
         size_t ef,
         vl_type * visited_array,
         vl_type visited_array_tag,
-        CandidateQueue_t & top_candidates,
+        ResultList & top_candidates,
         CandidateQueue_t & candidate_set,
         dist_t & lowerBound,
         TerminationPolicy & termination_state,
@@ -667,20 +782,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     }
 
-    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void>
-    CandidateQueue_t
+    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void, class ResultList = CandidateQueue_t>
+    ResultList
     searchBaseLayerSTNoFilter(tableint ep_id, const void *data_point, size_t ef) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        CandidateQueue_t top_candidates;
+        ResultList top_candidates = makeResultList<ResultList>();
         CandidateQueue_t candidate_set;
 
         dist_t lowerBound;
         dist_t dist = calcDistance<DistFn> ( data_point, ep_id );
         lowerBound = dist;
-        top_candidates.emplace(dist, ep_id);
+        pushSeed(top_candidates, dist, ep_id);
         candidate_set.emplace(-dist, ep_id);
 
         visited_array[ep_id] = visited_array_tag;
@@ -694,29 +809,29 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
-    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void>
-    CandidateQueue_t
+    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void, class ResultList = CandidateQueue_t>
+    ResultList
     searchBaseLayerST(tableint ep_id, const void *data_point, size_t ef, BaseFilterFunctor* isIdAllowed = nullptr) const {
         if ( shouldUseAcorn(isIdAllowed) )
-            return searchBaseLayerSTFilteredAcorn<TerminationPolicy, has_deletions, collect_metrics, DistFn>(ep_id, data_point, ef, isIdAllowed);
+            return searchBaseLayerSTFilteredAcorn<TerminationPolicy, has_deletions, collect_metrics, DistFn, ResultList>(ep_id, data_point, ef, isIdAllowed);
 
         if constexpr (!has_deletions) {
             if (!isIdAllowed)
-                return searchBaseLayerSTNoFilter<TerminationPolicy, has_deletions, collect_metrics, DistFn>(ep_id, data_point, ef);
+                return searchBaseLayerSTNoFilter<TerminationPolicy, has_deletions, collect_metrics, DistFn, ResultList>(ep_id, data_point, ef);
         }
 
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        CandidateQueue_t top_candidates;
+        ResultList top_candidates = makeResultList<ResultList>();
         CandidateQueue_t candidate_set;
 
         dist_t lowerBound;
         if ((!has_deletions || !isMarkedDeleted(ep_id)) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id)))) {
             dist_t dist = calcDistance<DistFn> ( data_point, ep_id );
             lowerBound = dist;
-            top_candidates.emplace(dist, ep_id);
+            pushSeed(top_candidates, dist, ep_id);
             candidate_set.emplace(-dist, ep_id);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
@@ -738,8 +853,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return top_candidates;
     }
 
-    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void>
-    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    template <typename TerminationPolicy = NoopTerminationState, bool has_deletions, bool collect_metrics = false, class DistFn = void, class ResultList = CandidateQueue_t>
+    ResultList
     searchBaseLayerSTFilteredAcorn(
         tableint ep_id,
         const void *data_point,
@@ -750,7 +865,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+        ResultList top_candidates = makeResultList<ResultList>();
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
         auto isAllowed = [&](tableint id) -> bool
@@ -764,7 +879,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if ((!has_deletions || !isMarkedDeleted(ep_id)) && isAllowed(ep_id))
         {
             lowerBound = dist;
-            top_candidates.emplace(dist, ep_id);
+            pushSeed(top_candidates, dist, ep_id);
         }
 
         visited_array[ep_id] = visited_array_tag;
@@ -1884,12 +1999,59 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // Grouped collection, used when a group map is set: emits one entry per group, carrying that group's best distance and its group id as the label
+    template <typename TerminationPolicy, bool collect_metrics, class DistFn>
+    std::vector<std::pair<dist_t, labeltype>>
+    searchKnnGrouped(tableint currObj, const void * query_data, size_t k, size_t searchEf,
+                     BaseFilterFunctor * isIdAllowed) const {
+        GroupedCandidates_t top_candidates = num_deleted_
+            ? searchBaseLayerST<TerminationPolicy, true, collect_metrics, DistFn, GroupedCandidates_t>(currObj, query_data, searchEf, isIdAllowed)
+            : searchBaseLayerST<TerminationPolicy, false, collect_metrics, DistFn, GroupedCandidates_t>(currObj, query_data, searchEf, isIdAllowed);
+
+        // trim to the k nearest groups, then emit one entry per remaining group
+        while (top_candidates.size() > k)
+            top_candidates.popFarthest();
+
+        std::vector<std::pair<dist_t, labeltype>> result;
+        result.reserve(top_candidates.size());
+        dist_t tDist;
+        labeltype tLabel;
+        while (top_candidates.popResult(tDist, tLabel))
+            result.emplace_back(tDist, tLabel);
+
+        return result;
+    }
+
+
+    // Ungrouped collection: one entry per vector
+    template <typename TerminationPolicy, bool collect_metrics, class DistFn>
+    std::vector<std::pair<dist_t, labeltype>>
+    searchKnnPlain(tableint currObj, const void * query_data, size_t k, size_t searchEf,
+                   BaseFilterFunctor * isIdAllowed) const {
+        CandidateQueue_t top_candidates = num_deleted_
+            ? searchBaseLayerST<TerminationPolicy, true, collect_metrics, DistFn>(currObj, query_data, searchEf, isIdAllowed)
+            : searchBaseLayerST<TerminationPolicy, false, collect_metrics, DistFn>(currObj, query_data, searchEf, isIdAllowed);
+
+        while (top_candidates.size() > k)
+            top_candidates.pop();
+
+        std::vector<std::pair<dist_t, labeltype>> result;
+        result.reserve(top_candidates.size());
+        while (!top_candidates.empty()) {
+            std::pair<dist_t, tableint> rez = top_candidates.top();
+            result.emplace_back(rez.first, getExternalLabel(rez.second));
+            top_candidates.pop();
+        }
+
+        return result;
+    }
+
+
     template <typename TerminationPolicy = NoopTerminationState, bool collect_metrics = false, class DistFn = void>
     std::vector<std::pair<dist_t, labeltype>>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr,
               size_t * ef = nullptr) const {
-        std::vector<std::pair<dist_t, labeltype>> result;
-        if (cur_element_count == 0) return result;
+        if (cur_element_count == 0) return {};
 
         tableint currObj = enterpoint_node_;
         dist_t curdist = calcDistance<DistFn> ( query_data, enterpoint_node_ );
@@ -1951,25 +2113,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         size_t searchEf = std::max(ef_, k);
         if ( ef )
             searchEf = std::max(searchEf, *ef);
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        if (num_deleted_) {
-            top_candidates = searchBaseLayerST<TerminationPolicy, true, collect_metrics, DistFn>(
-                    currObj, query_data, searchEf, isIdAllowed);
-        } else {
-            top_candidates = searchBaseLayerST<TerminationPolicy, false, collect_metrics, DistFn>(
-                    currObj, query_data, searchEf, isIdAllowed);
-        }
 
-        while (top_candidates.size() > k) {
-            top_candidates.pop();
-        }
-        result.reserve(top_candidates.size());
-        while (top_candidates.size() > 0) {
-            std::pair<dist_t, tableint> rez = top_candidates.top();
-            result.emplace_back(rez.first, getExternalLabel(rez.second));
-            top_candidates.pop();
-        }
-        return result;
+        return group_map_
+            ? searchKnnGrouped<TerminationPolicy, collect_metrics, DistFn>(currObj, query_data, k, searchEf, isIdAllowed)
+            : searchKnnPlain<TerminationPolicy, collect_metrics, DistFn>(currObj, query_data, k, searchEf, isIdAllowed);
     }
 
 
