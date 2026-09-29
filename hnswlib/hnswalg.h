@@ -51,7 +51,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     int filtered_search_threshold_{DEFAULT_FILTERED_SEARCH_THRESHOLD};
 
     // Optional label -> group map, indexed by external label. When set, search collects one result
-    // per group instead of one per label, and returns group ids in place of labels.
+    // per group and returns the winning label for each group.
     const uint32_t * group_map_{nullptr};
 
     double mult_{0.0}, revSize_{0.0};
@@ -230,14 +230,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 dist = std::numeric_limits<dist_t>::max();
 
             uint32_t g = groupOf(id);
+            labeltype label = idx_->getExternalLabel(id);
             auto it = pos_.find(g);
             if (it == pos_.end()) {
-                pos_.emplace ( g, entries_.insert ( Entry_t{dist, g} ).first );
+                pos_.emplace ( g, entries_.insert ( Entry_t{dist, g, label} ).first );
                 return true;
             }
-            if (dist < it->second->dist) {
+            if (dist < it->second->dist || (dist == it->second->dist && label < it->second->label)) {
                 entries_.erase ( it->second );
-                it->second = entries_.insert ( Entry_t{dist, g} ).first;
+                it->second = entries_.insert ( Entry_t{dist, g, label} ).first;
                 return true;
             }
             return false;   // a worse duplicate of a group we already hold: dropped
@@ -253,19 +254,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             entries_.erase(it);
         }
 
-        // farthest group as (best distance, group id)
+        // farthest group as (best distance, winning external label)
         bool popResult ( dist_t & dist, labeltype & label ) {
             if (entries_.empty()) return false;
             auto it = std::prev ( entries_.end() );
             dist = it->dist;
-            label = (labeltype)it->group;
+            label = it->label;
             pos_.erase ( it->group );
             entries_.erase(it);
             return true;
         }
 
     private:
-        struct Entry_t { dist_t dist; uint32_t group; };
+        struct Entry_t { dist_t dist; uint32_t group; labeltype label; };
         struct CompareEntry_t {
             // one entry per group is enforced in push()'s job, here we are only comparing different groups with potentially equal distances
             bool operator() ( const Entry_t & a, const Entry_t & b ) const {
