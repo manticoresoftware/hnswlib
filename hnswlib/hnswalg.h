@@ -668,7 +668,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     {
         termination_state.onDistanceScored();
 
-        if (top_candidates.size() < ef || lowerBound > dist) {
+        bool withinBound = top_candidates.size() < ef || lowerBound > dist;
+        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+            withinBound = withinBound || lowerBound == dist; // inspect exact ties so the lowest label wins
+
+        if (withinBound) {
             candidate_set.emplace(-dist, candidate_id);
 
             if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )

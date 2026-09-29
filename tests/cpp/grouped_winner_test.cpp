@@ -27,5 +27,17 @@ int main() {
 
     // Group 0 has an exact tie: the lower global vector label must win.
     assert(labels == std::set<hnswlib::labeltype>({0, 2}));
+
+    // Exercise the full result-list boundary too: the equal-distance lower label
+    // must still be admitted when ef is already full.
+    hnswlib::HierarchicalNSW<float> tight(&space, 2, 2, 10);
+    tight.addPoint(&tied, 1);
+    tight.addPoint(&tied, 0);
+    const uint32_t one_group[] = {0, 0};
+    tight.setGroupMap(one_group);
+    tight.setEf(1);
+    const auto tied_result = tight.searchKnn(&query, 1);
+    assert(tied_result.size() == 1);
+    assert(tied_result.front().second == 0);
     return 0;
 }
