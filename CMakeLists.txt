@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(hnswlib VERSION "1.0.0" LANGUAGES CXX)
+project(hnswlib VERSION "1.1.0" LANGUAGES CXX)
 
 add_library(hnswlib INTERFACE)
 target_include_directories ( hnswlib INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/hnswlib>$<INSTALL_INTERFACE:include> )
