@@ -51,7 +51,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     int filtered_search_threshold_{DEFAULT_FILTERED_SEARCH_THRESHOLD};
 
     // Optional label -> group map, indexed by external label. When set, search collects one result
-    // per group and returns the winning label for each group.
+    // per group instead of one per label, and returns group ids in place of labels.
     const uint32_t * group_map_{nullptr};
 
     double mult_{0.0}, revSize_{0.0};
@@ -222,15 +222,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         uint32_t groupOf ( tableint id ) const { return group_map_[idx_->getExternalLabel(id)]; }
 
-        bool canImproveTiedWinner ( dist_t dist, tableint id ) const {
-            const uint32_t group = groupOf(id);
-            const auto it = pos_.find(group);
-            if (it == pos_.end()) return false;
-
-            const labeltype label = idx_->getExternalLabel(id);
-            return dist == it->second->dist && label < it->second->label;
-        }
-
         // returns true if the list changed, i.e. wherever the plain heap would have been pushed.
         // Callers use this to drive the termination policy's admission counter.
         bool push ( dist_t dist, tableint id ) {
@@ -239,15 +230,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 dist = std::numeric_limits<dist_t>::max();
 
             uint32_t g = groupOf(id);
-            labeltype label = idx_->getExternalLabel(id);
             auto it = pos_.find(g);
             if (it == pos_.end()) {
-                pos_.emplace ( g, entries_.insert ( Entry_t{dist, g, label} ).first );
+                pos_.emplace ( g, entries_.insert ( Entry_t{dist, g} ).first );
                 return true;
             }
-            if (dist < it->second->dist || (dist == it->second->dist && label < it->second->label)) {
+            if (dist < it->second->dist) {
                 entries_.erase ( it->second );
-                it->second = entries_.insert ( Entry_t{dist, g, label} ).first;
+                it->second = entries_.insert ( Entry_t{dist, g} ).first;
                 return true;
             }
             return false;   // a worse duplicate of a group we already hold: dropped
@@ -263,19 +253,19 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             entries_.erase(it);
         }
 
-        // farthest group as (best distance, winning external label)
+        // farthest group as (best distance, group id)
         bool popResult ( dist_t & dist, labeltype & label ) {
             if (entries_.empty()) return false;
             auto it = std::prev ( entries_.end() );
             dist = it->dist;
-            label = it->label;
+            label = (labeltype)it->group;
             pos_.erase ( it->group );
             entries_.erase(it);
             return true;
         }
 
     private:
-        struct Entry_t { dist_t dist; uint32_t group; labeltype label; };
+        struct Entry_t { dist_t dist; uint32_t group; };
         struct CompareEntry_t {
             // one entry per group is enforced in push()'s job, here we are only comparing different groups with potentially equal distances
             bool operator() ( const Entry_t & a, const Entry_t & b ) const {
@@ -677,15 +667,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     {
         termination_state.onDistanceScored();
 
-        const bool withinExpansionBound = top_candidates.size() < ef || lowerBound > dist;
-        if (withinExpansionBound)
+        if (top_candidates.size() < ef || lowerBound > dist) {
             candidate_set.emplace(-dist, candidate_id);
 
-        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
-        {
-            // Exact ties may replace a group's winner with a lower label, but
-            // must not expand an unbounded equal-distance graph plateau.
-            if (withinExpansionBound || (lowerBound == dist && top_candidates.canImproveTiedWinner(dist, candidate_id)))
+            if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
             {
                 // fires on a new group and on an improvement to an existing one
                 if (fnAllowTopCandidate(candidate_id) && top_candidates.push(dist, candidate_id))
@@ -697,20 +682,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (!top_candidates.empty())
                     lowerBound = top_candidates.farthest();
             }
-        }
-        else if (withinExpansionBound)
-        {
-            if (fnAllowTopCandidate(candidate_id))
+            else
             {
-                top_candidates.emplace(dist, candidate_id);
-                termination_state.onCandidateCollected();
+                if (fnAllowTopCandidate(candidate_id))
+				{
+                    top_candidates.emplace(dist, candidate_id);
+                    termination_state.onCandidateCollected();
+                }
+
+                if (top_candidates.size() > ef)
+                    top_candidates.pop();
+
+                if (!top_candidates.empty())
+                    lowerBound = top_candidates.top().first;
             }
-
-            if (top_candidates.size() > ef)
-                top_candidates.pop();
-
-            if (!top_candidates.empty())
-                lowerBound = top_candidates.top().first;
         }
     }
 
@@ -2014,9 +1999,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    // Grouped collection, used when a group map is set: emits one entry per group,
-    // carrying that group's best distance and winning external vector label.
-    // Callers can recover the group through the same group map supplied to setGroupMap().
+    // Grouped collection, used when a group map is set: emits one entry per group, carrying that group's best distance and its group id as the label
     template <typename TerminationPolicy, bool collect_metrics, class DistFn>
     std::vector<std::pair<dist_t, labeltype>>
     searchKnnGrouped(tableint currObj, const void * query_data, size_t k, size_t searchEf,
