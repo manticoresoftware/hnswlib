@@ -47,6 +47,9 @@ jobs:
           fi
         shell: bash
 
+      - name: Test grouped search winner
+        run: ctest --test-dir build -C Release --output-on-failure -R grouped_winner
+
       - name: Prepare test data
         run: |
           pip install numpy
