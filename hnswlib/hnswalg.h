@@ -222,6 +222,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         uint32_t groupOf ( tableint id ) const { return group_map_[idx_->getExternalLabel(id)]; }
 
+        bool canImproveTiedWinner ( dist_t dist, tableint id ) const {
+            const uint32_t group = groupOf(id);
+            const auto it = pos_.find(group);
+            if (it == pos_.end()) return false;
+
+            const labeltype label = idx_->getExternalLabel(id);
+            return dist == it->second->dist && label < it->second->label;
+        }
+
         // returns true if the list changed, i.e. wherever the plain heap would have been pushed.
         // Callers use this to drive the termination policy's admission counter.
         bool push ( dist_t dist, tableint id ) {
@@ -676,7 +685,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             // Exact ties may replace a group's winner with a lower label, but
             // must not expand an unbounded equal-distance graph plateau.
-            if (withinExpansionBound || lowerBound == dist)
+            if (withinExpansionBound || (lowerBound == dist && top_candidates.canImproveTiedWinner(dist, candidate_id)))
             {
                 // fires on a new group and on an improvement to an existing one
                 if (fnAllowTopCandidate(candidate_id) && top_candidates.push(dist, candidate_id))

@@ -67,6 +67,14 @@ int main() {
     if (tied_result.size() != 1 || tied_result.front().second != 0)
         return fail("the lower tied label did not win at a full result boundary");
 
+    // An equal-distance vector from a different group must not replace the
+    // group already admitted at the result boundary.
+    const uint32_t separate_groups[] = {5, 10};
+    tight.setGroupMap(separate_groups);
+    const auto separate_result = tight.searchKnn(&query, 1);
+    if (separate_result.size() != 1 || separate_result.front().second != 1)
+        return fail("an equal-distance new group replaced the admitted group");
+
     // Equal-distance candidates may update a group winner but must not all be
     // admitted to the graph-expansion frontier. With ef=1, searching
     // this all-equal graph should inspect only a bounded neighborhood instead
