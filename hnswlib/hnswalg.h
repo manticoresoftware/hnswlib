@@ -668,14 +668,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     {
         termination_state.onDistanceScored();
 
-        bool withinBound = top_candidates.size() < ef || lowerBound > dist;
-        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
-            withinBound = withinBound || lowerBound == dist; // inspect exact ties so the lowest label wins
-
-        if (withinBound) {
+        const bool withinExpansionBound = top_candidates.size() < ef || lowerBound > dist;
+        if (withinExpansionBound)
             candidate_set.emplace(-dist, candidate_id);
 
-            if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+        if constexpr ( std::is_same_v<ResultList, GroupedCandidates_t> )
+        {
+            // Exact ties may replace a group's winner with a lower label, but
+            // must not expand an unbounded equal-distance graph plateau.
+            if (withinExpansionBound || lowerBound == dist)
             {
                 // fires on a new group and on an improvement to an existing one
                 if (fnAllowTopCandidate(candidate_id) && top_candidates.push(dist, candidate_id))
@@ -687,20 +688,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (!top_candidates.empty())
                     lowerBound = top_candidates.farthest();
             }
-            else
+        }
+        else if (withinExpansionBound)
+        {
+            if (fnAllowTopCandidate(candidate_id))
             {
-                if (fnAllowTopCandidate(candidate_id))
-				{
-                    top_candidates.emplace(dist, candidate_id);
-                    termination_state.onCandidateCollected();
-                }
-
-                if (top_candidates.size() > ef)
-                    top_candidates.pop();
-
-                if (!top_candidates.empty())
-                    lowerBound = top_candidates.top().first;
+                top_candidates.emplace(dist, candidate_id);
+                termination_state.onCandidateCollected();
             }
+
+            if (top_candidates.size() > ef)
+                top_candidates.pop();
+
+            if (!top_candidates.empty())
+                lowerBound = top_candidates.top().first;
         }
     }
 
@@ -2004,7 +2005,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    // Grouped collection, used when a group map is set: emits one entry per group, carrying that group's best distance and its group id as the label
+    // Grouped collection, used when a group map is set: emits one entry per group,
+    // carrying that group's best distance and winning external vector label.
+    // Callers can recover the group through the same group map supplied to setGroupMap().
     template <typename TerminationPolicy, bool collect_metrics, class DistFn>
     std::vector<std::pair<dist_t, labeltype>>
     searchKnnGrouped(tableint currObj, const void * query_data, size_t k, size_t searchEf,
