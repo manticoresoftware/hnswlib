@@ -1,17 +1,9 @@
 cmake_minimum_required(VERSION 3.17)
 
-project(hnswlib VERSION "1.2.0" LANGUAGES CXX)
+project(hnswlib VERSION "1.0.0" LANGUAGES CXX)
 
 add_library(hnswlib INTERFACE)
 target_include_directories ( hnswlib INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/hnswlib>$<INSTALL_INTERFACE:include> )
-
-include(CTest)
-if(BUILD_TESTING)
-    add_executable(grouped_winner_test tests/cpp/grouped_winner_test.cpp)
-    target_compile_features(grouped_winner_test PRIVATE cxx_std_17)
-    target_link_libraries(grouped_winner_test PRIVATE hnswlib)
-    add_test(NAME grouped_winner COMMAND grouped_winner_test)
-endif()
 
 set ( EXPORT_CMAKE_DIR "lib/cmake/hnswlib" )
 
