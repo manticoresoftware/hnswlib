@@ -231,8 +231,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return dist == it->second->dist && label < it->second->label;
         }
 
-        // returns true if the list changed, i.e. wherever the plain heap would have been pushed.
-        // Callers use this to drive the termination policy's admission counter.
+        // returns true when the search made progress: a new group, or a closer distance for a group already held,
+        // i.e. wherever the plain heap would have been pushed. Callers use this to drive the termination policy's
+        // admission counter. An equal-distance candidate with a lower label replaces the group's winner (so the
+        // representative is deterministic), but that is not progress and must not look like a discovery
         bool push ( dist_t dist, tableint id ) {
 			// check for NaN
             if ( dist != dist )
@@ -245,10 +247,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 pos_.emplace ( g, entries_.insert ( Entry_t{dist, g, label} ).first );
                 return true;
             }
-            if (dist < it->second->dist || (dist == it->second->dist && label < it->second->label)) {
+            const bool closer = dist < it->second->dist;
+            if (closer || (dist == it->second->dist && label < it->second->label)) {
                 entries_.erase ( it->second );
                 it->second = entries_.insert ( Entry_t{dist, g, label} ).first;
-                return true;
+                return closer;
             }
             return false;   // a worse duplicate of a group we already hold: dropped
         }
